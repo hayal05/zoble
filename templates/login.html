@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% block title %}Log in · Zoble Chat{% endblock %}
+
+{% block body %}
+<div class="auth-screen">
+    <div class="auth-card">
+        <div class="brand-mark">
+            <span class="brand-dot"></span>
+            <span class="brand-word">Zoble Chat</span>
+        </div>
+        <form id="loginForm" class="auth-form" novalidate>
+            <p class="field-success" id="resetSuccessNotice" hidden>Password reset. Log in with your new password.</p>
+
+            <label class="field-label" for="username">Username, email, or phone number</label>
+            <input class="field-input" type="text" id="username" name="username" autocomplete="username" required>
+
+            <label class="field-label" for="password">Password</label>
+            <input class="field-input" type="password" id="password" name="password" autocomplete="current-password" required>
+
+            <p class="field-error" id="loginError" hidden></p>
+
+            <button class="btn btn-primary btn-block" type="submit">Log in</button>
+        </form>
+
+        <p class="auth-switch"><a href="{{ url_for('forgot_password_page') }}">Forgot password?</a></p>
+        <p class="auth-switch">Don't have an account? <a href="{{ url_for('register_page') }}">Create one</a></p>
+    </div>
+</div>
+
+<script>
+    if (new URLSearchParams(window.location.search).get("reset") === "1") {
+        document.getElementById("resetSuccessNotice").hidden = false;
+    }
+
+    document.getElementById("loginForm").addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const errorEl = document.getElementById("loginError");
+        errorEl.hidden = true;
+
+        const payload = {
+            username: document.getElementById("username").value.trim(),
+            password: document.getElementById("password").value,
+        };
+
+        const submitBtn = document.querySelector("#loginForm button[type=submit]");
+        submitBtn.disabled = true;
+        submitBtn.classList.add("is-loading");
+
+        try {
+            const res = await fetch("/api/login", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload),
+            });
+            const data = await res.json();
+
+            if (!res.ok) {
+                errorEl.textContent = data.error || "Something went wrong.";
+                errorEl.hidden = false;
+                return;
+            }
+
+            // Left in its loading state on success — the page is about to
+            // navigate away, so there's no "done" moment to reset it at.
+            window.location.href = "/";
+        } catch (err) {
+            errorEl.textContent = "Network error. Please try again.";
+            errorEl.hidden = false;
+        } finally {
+            if (!errorEl.hidden) {
+                submitBtn.disabled = false;
+                submitBtn.classList.remove("is-loading");
+            }
+        }
+    });
+</script>
+{% endblock %}

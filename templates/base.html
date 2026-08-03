@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Zoble Chat{% endblock %}</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    {% block extra_head %}{% endblock %}
+    <script>
+        // Belt-and-suspenders for the phone's hardware/gesture back button.
+        // The server already sends no-store headers so it re-checks auth on
+        // every navigation, but some mobile browsers (notably iOS Safari)
+        // can still restore a page from bfcache without re-asking the
+        // server. `event.persisted` is true exactly in that case, so we
+        // force a real reload — which re-runs the server-side auth check
+        // and guarantees a logged-in user landing back on /login or
+        // /register gets bounced straight to the chat instead of seeing a
+        // stale "logged out" snapshot.
+        window.addEventListener("pageshow", (event) => {
+            if (event.persisted) {
+                window.location.reload();
+            }
+        });
+
+        // Registers the offline app-shell service worker (static/sw.js).
+        // This is what lets Median show the last-loaded page instead of
+        // its native "no internet" error when the connection drops.
+        if ("serviceWorker" in navigator) {
+            window.addEventListener("load", () => {
+                navigator.serviceWorker.register("/sw.js").catch((err) => {
+                    console.error("Service worker registration failed:", err);
+                });
+            });
+        }
+    </script>
+</head>
+<body>
+    {% block body %}{% endblock %}
+</body>
+</html>
