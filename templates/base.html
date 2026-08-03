@@ -38,5 +38,21 @@
 </head>
 <body>
     {% block body %}{% endblock %}
+    <script>
+        // Generic password show/hide wiring — works for any
+        // .field-password-toggle button paired with an input via
+        // data-target, so login/register/reset pages don't each need
+        // their own copy of this logic.
+        document.querySelectorAll(".field-password-toggle").forEach((btn) => {
+            const input = document.getElementById(btn.dataset.target);
+            if (!input) return;
+            btn.addEventListener("click", () => {
+                const nowShowing = input.type === "password";
+                input.type = nowShowing ? "text" : "password";
+                btn.classList.toggle("is-showing", nowShowing);
+                btn.setAttribute("aria-label", nowShowing ? "Hide password" : "Show password");
+            });
+        });
+    </script>
 </body>
 </html>
