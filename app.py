@@ -211,21 +211,15 @@ CLOUDINARY_API_SECRET = os.environ.get("CLOUDINARY_API_SECRET")
 CLOUDINARY_CONFIGURED = bool(CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET)
 
 if not CLOUDINARY_CONFIGURED:
-    if IS_PRODUCTION:
-        # Fail loudly rather than silently running a production deployment
-        # that would otherwise fall back to doing image compression on
-        # this server's own CPU/RAM — the whole point of requiring
-        # Cloudinary is to guarantee that never happens.
-        raise RuntimeError(
-            "CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET "
-            "environment variables are all required when FLASK_ENV=production."
-        )
-    logger.warning(
-        "Cloudinary not configured — uploaded images will be stored and "
-        "served locally, uncompressed, and won't survive a redeploy on an "
-        "ephemeral filesystem. Fine for local development; set "
-        "CLOUDINARY_CLOUD_NAME/CLOUDINARY_API_KEY/CLOUDINARY_API_SECRET "
-        "before deploying."
+    # Unconditional — no local-dev exception. Cloudinary is the only
+    # thing standing between an uploaded image and this server's own
+    # CPU/RAM (see the OOM kills this was written to prevent), so there
+    # must be no code path, dev included, where that protection is
+    # silently absent.
+    raise RuntimeError(
+        "CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET "
+        "environment variables are all required — image compression runs on "
+        "Cloudinary, not on this server, and there is no local fallback."
     )
 
 
