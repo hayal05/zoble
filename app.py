@@ -396,13 +396,21 @@ def _run_on_conn_thread(dbapi_connection, func, *args):
 
 @_sa_event.listens_for(_SAEngine, "do_execute")
 def _tpool_do_execute(cursor, statement, parameters, context):
-    _run_on_conn_thread(cursor.connection, cursor.execute, statement, parameters)
+    # cursor.connection isn't available here — libsql's cursor object
+    # doesn't implement the standard DBAPI 2.0 Cursor.connection attribute
+    # (AttributeError: 'builtins.Cursor' object has no attribute
+    # 'connection'). Get the raw DBAPI connection via SQLAlchemy's own
+    # execution context instead, which doesn't depend on the driver
+    # providing that.
+    dbapi_connection = context.root_connection.connection.dbapi_connection
+    _run_on_conn_thread(dbapi_connection, cursor.execute, statement, parameters)
     return True
 
 
 @_sa_event.listens_for(_SAEngine, "do_execute_no_params")
 def _tpool_do_execute_no_params(cursor, statement, context):
-    _run_on_conn_thread(cursor.connection, cursor.execute, statement)
+    dbapi_connection = context.root_connection.connection.dbapi_connection
+    _run_on_conn_thread(dbapi_connection, cursor.execute, statement)
     return True
 
 
