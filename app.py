@@ -334,8 +334,24 @@ db = SQLAlchemy(app)
 # this process's single eventlet worker outright (freezing every other
 # request and Socket.IO heartbeat until the call returns). Same problem,
 # same fix as validate_uploaded_image()'s Pillow call above: push the
-# blocking work onto eventlet's native-thread pool via eventlet.tpool so
-# the event loop stays free while it runs.
+# blocking work onto real OS threads so the event loop stays free while
+# it runs.
+#
+# IMPORTANT: unlike the Pillow call, this can't just be
+# eventlet.tpool.execute(...) per call. SQLite-family connections
+# (libsql included) are thread-affine — a connection opened on one OS
+# thread generally can't safely be used from a different one, and
+# eventlet.tpool's shared pool hands each call to whichever worker
+# thread is free, with no guarantee it's the same thread twice. Opening
+# the connection on one tpool thread and then running a query on
+# another is a good way to get a silent hang rather than a clean error.
+#
+# So instead: give every connection its own dedicated single-thread
+# executor at connect time, and route every operation on that
+# connection through that same thread for its whole lifetime. We still
+# use eventlet.tpool.execute() — but only to cooperatively wait on the
+# dedicated thread's result, never to run the DB call itself on an
+# arbitrary shared-pool thread.
 #
 # Hooked at the SQLAlchemy Engine class level (not a specific engine)
 # so it covers every cursor execution and every new DBAPI connection —
@@ -344,25 +360,58 @@ db = SQLAlchemy(app)
 # this file. Returning a value from do_execute*/do_connect tells
 # SQLAlchemy "this event already did the work," which skips its own
 # (blocking) call to the same function.
+import weakref
+from concurrent.futures import ThreadPoolExecutor
 from sqlalchemy.engine import Engine as _SAEngine
 from sqlalchemy import event as _sa_event
+
+# Maps each live DBAPI connection -> the one dedicated OS thread that is
+# allowed to touch it. WeakKeyDictionary so entries clean themselves up
+# as connections get garbage-collected/recycled by the pool.
+_conn_executors = weakref.WeakKeyDictionary()
 
 
 @_sa_event.listens_for(_SAEngine, "do_connect")
 def _tpool_do_connect(dialect, conn_rec, cargs, cparams):
-    return eventlet.tpool.execute(dialect.dbapi.connect, *cargs, **cparams)
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(dialect.dbapi.connect, *cargs, **cparams)
+    conn = eventlet.tpool.execute(future.result)
+    _conn_executors[conn] = executor
+    return conn
+
+
+def _run_on_conn_thread(dbapi_connection, func, *args):
+    executor = _conn_executors.get(dbapi_connection)
+    if executor is None:
+        # Shouldn't happen (do_connect always registers one first), but
+        # fall back to a one-off thread rather than crashing the request.
+        executor = ThreadPoolExecutor(max_workers=1)
+        _conn_executors[dbapi_connection] = executor
+    future = executor.submit(func, *args)
+    return eventlet.tpool.execute(future.result)
 
 
 @_sa_event.listens_for(_SAEngine, "do_execute")
 def _tpool_do_execute(cursor, statement, parameters, context):
-    eventlet.tpool.execute(cursor.execute, statement, parameters)
+    _run_on_conn_thread(cursor.connection, cursor.execute, statement, parameters)
     return True
 
 
 @_sa_event.listens_for(_SAEngine, "do_execute_no_params")
 def _tpool_do_execute_no_params(cursor, statement, context):
-    eventlet.tpool.execute(cursor.execute, statement)
+    _run_on_conn_thread(cursor.connection, cursor.execute, statement)
     return True
+
+
+@_sa_event.listens_for(_SAEngine, "close")
+def _tpool_close(dbapi_connection, conn_rec):
+    # Pool is retiring this connection — shut its dedicated thread down
+    # instead of leaving it idle forever. shutdown() itself is quick
+    # (no in-flight work at this point), so no need to route it through
+    # tpool.
+    executor = _conn_executors.pop(dbapi_connection, None)
+    if executor is not None:
+        executor.shutdown(wait=False)
 
 
 login_manager = LoginManager(app)
