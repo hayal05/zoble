@@ -360,15 +360,18 @@ db = SQLAlchemy(app)
 # this file. Returning a value from do_execute*/do_connect tells
 # SQLAlchemy "this event already did the work," which skips its own
 # (blocking) call to the same function.
-import weakref
 from concurrent.futures import ThreadPoolExecutor
 from sqlalchemy.engine import Engine as _SAEngine
 from sqlalchemy import event as _sa_event
 
-# Maps each live DBAPI connection -> the one dedicated OS thread that is
-# allowed to touch it. WeakKeyDictionary so entries clean themselves up
-# as connections get garbage-collected/recycled by the pool.
-_conn_executors = weakref.WeakKeyDictionary()
+# Maps id(dbapi_connection) -> the one dedicated OS thread that is allowed
+# to touch it. Keyed by id() rather than holding the connection object
+# itself (e.g. via WeakKeyDictionary) because Turso/libsql's connection
+# object is a compiled extension type that doesn't support Python weak
+# references (raises TypeError: cannot create weak reference to
+# 'builtins.Connection' object). Entries are cleaned up explicitly by the
+# "close" listener below rather than relying on GC.
+_conn_executors = {}
 
 
 @_sa_event.listens_for(_SAEngine, "do_connect")
@@ -376,17 +379,17 @@ def _tpool_do_connect(dialect, conn_rec, cargs, cparams):
     executor = ThreadPoolExecutor(max_workers=1)
     future = executor.submit(dialect.dbapi.connect, *cargs, **cparams)
     conn = eventlet.tpool.execute(future.result)
-    _conn_executors[conn] = executor
+    _conn_executors[id(conn)] = executor
     return conn
 
 
 def _run_on_conn_thread(dbapi_connection, func, *args):
-    executor = _conn_executors.get(dbapi_connection)
+    executor = _conn_executors.get(id(dbapi_connection))
     if executor is None:
         # Shouldn't happen (do_connect always registers one first), but
         # fall back to a one-off thread rather than crashing the request.
         executor = ThreadPoolExecutor(max_workers=1)
-        _conn_executors[dbapi_connection] = executor
+        _conn_executors[id(dbapi_connection)] = executor
     future = executor.submit(func, *args)
     return eventlet.tpool.execute(future.result)
 
@@ -409,7 +412,7 @@ def _tpool_close(dbapi_connection, conn_rec):
     # instead of leaving it idle forever. shutdown() itself is quick
     # (no in-flight work at this point), so no need to route it through
     # tpool.
-    executor = _conn_executors.pop(dbapi_connection, None)
+    executor = _conn_executors.pop(id(dbapi_connection), None)
     if executor is not None:
         executor.shutdown(wait=False)
 
