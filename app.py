@@ -320,6 +320,44 @@ os.makedirs(POST_PHOTOS_FOLDER, exist_ok=True)
 
 db = SQLAlchemy(app)
 
+# ---------------------------------------------------------------------
+# Turso/libsql runs its network I/O through a compiled (Rust) extension,
+# not Python's socket module — eventlet.monkey_patch() at the top of this
+# file has no visibility into it, so every DB call would otherwise block
+# this process's single eventlet worker outright (freezing every other
+# request and Socket.IO heartbeat until the call returns). Same problem,
+# same fix as validate_uploaded_image()'s Pillow call above: push the
+# blocking work onto eventlet's native-thread pool via eventlet.tpool so
+# the event loop stays free while it runs.
+#
+# Hooked at the SQLAlchemy Engine class level (not a specific engine)
+# so it covers every cursor execution and every new DBAPI connection —
+# both the Turso/libsql path and the local-SQLite fallback — without
+# having to touch the ~200 call sites that use db.session elsewhere in
+# this file. Returning a value from do_execute*/do_connect tells
+# SQLAlchemy "this event already did the work," which skips its own
+# (blocking) call to the same function.
+from sqlalchemy.engine import Engine as _SAEngine
+from sqlalchemy import event as _sa_event
+
+
+@_sa_event.listens_for(_SAEngine, "do_connect")
+def _tpool_do_connect(dialect, conn_rec, cargs, cparams):
+    return eventlet.tpool.execute(dialect.dbapi.connect, *cargs, **cparams)
+
+
+@_sa_event.listens_for(_SAEngine, "do_execute")
+def _tpool_do_execute(cursor, statement, parameters, context):
+    eventlet.tpool.execute(cursor.execute, statement, parameters)
+    return True
+
+
+@_sa_event.listens_for(_SAEngine, "do_execute_no_params")
+def _tpool_do_execute_no_params(cursor, statement, context):
+    eventlet.tpool.execute(cursor.execute, statement)
+    return True
+
+
 login_manager = LoginManager(app)
 login_manager.login_view = "login_page"
 login_manager.session_protection = "basic"  # "strong" ties the session to an IP/user-agent
