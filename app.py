@@ -1,5 +1,12 @@
 import eventlet
 eventlet.monkey_patch()
+import eventlet.tpool
+# ^ eventlet.tpool is a submodule, not auto-loaded just by `import eventlet`
+# above — it only becomes accessible as `eventlet.tpool` once something has
+# explicitly imported it. Loaded eagerly here, right after monkey_patch(),
+# so it's guaranteed available before the SQLAlchemy do_connect/do_execute
+# hooks below (which run as early as the app's first DB connection, i.e.
+# during startup) try to call eventlet.tpool.execute(...).
 # ^ MUST be the very first thing that happens in this module, before any other
 # import (including stdlib ones like os/logging). gunicorn is configured to run
 # this app with the eventlet worker (`gunicorn -k eventlet`, see Procfile), which
