@@ -45,6 +45,7 @@ def to_iso_utc(dt):
 
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, redirect, url_for, render_template, make_response, send_from_directory, abort
+from flask_compress import Compress
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import (
     LoginManager, UserMixin, login_user, logout_user,
@@ -91,6 +92,16 @@ logger = logging.getLogger("zoble_chat")
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp"}
 MAX_CONTENT_LENGTH = 5 * 1024 * 1024      # 5 MB upload ceiling
 MAX_IMAGE_DIMENSION = 4096                # reject absurdly large images (decompression-bomb guard)
+# Every uploaded image gets served through a Cloudinary transformation
+# capped at one of these dimensions — avatars are always small on
+# screen, and even chat/post/story photos are rarely viewed above
+# ~1600px wide. Serving full originals (up to 4096px / 5MB each) was the
+# single biggest driver of memory and CPU before Cloudinary took over
+# compression: every request that touched one of these files (serving
+# it, decoding it client-side) paid for pixels nobody was displaying.
+# See cloudinary_max_dimension_for() / cloudinary_delivery_url().
+IMAGE_MAX_DIMENSION_AVATAR = 512
+IMAGE_MAX_DIMENSION_CONTENT = 1600        # chat / post / story photos
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_.]{3,30}$")
 # Deliberately simple RFC-5322-ish check — good enough to catch typos without
 # rejecting valid addresses the way an overly strict regex tends to.
@@ -179,21 +190,44 @@ BREVO_FROM_NAME = os.environ.get("BREVO_FROM_NAME", "Zoble Chat")
 BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
 
 # -------------------------------------------------------------------
-# Uploaded image resilience (profile pics, chat/story/post photos, group photos)
+# Uploaded image resilience + compression (profile pics, chat/story/post
+# photos, group photos)
 # -------------------------------------------------------------------
-# Render's free-tier filesystem is wiped on every redeploy/restart, so any
-# file saved to static/uploads/ can vanish while the database row that
-# references it (which now lives in a persistent Turso DB) survives.
-# When all three of these are set, every upload is also mirrored to
-# Cloudinary (https://cloudinary.com, permanent free tier — 25GB), and
-# uploaded_file() below transparently redirects to the Cloudinary copy
-# whenever the local file is missing. Local disk stays the primary,
-# fast path; Cloudinary is purely a fallback, so leaving these unset just
-# means uploads behave exactly as before (and don't survive a redeploy).
+# Cloudinary (https://cloudinary.com, permanent free tier — 25GB) is now
+# the ONLY place image compression happens — see cloudinary_delivery_url()
+# and cloudinary_delivery_url() below. This server never decodes/resizes/
+# recompresses an uploaded image itself, so that CPU and memory cost never
+# lands on this process no matter how much traffic comes in. It also means
+# a Cloudinary account is required to run this app in production — see the
+# enforcement right below, which mirrors how SECRET_KEY is required.
+#
+# Local disk still holds the original upload (Cloudinary mirrors from it,
+# and it's what a redeploy on an ephemeral filesystem like Render's free
+# tier can wipe) — Cloudinary is the durable, always-on copy that
+# uploaded_file() redirects to for every request.
 CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME")
 CLOUDINARY_API_KEY = os.environ.get("CLOUDINARY_API_KEY")
 CLOUDINARY_API_SECRET = os.environ.get("CLOUDINARY_API_SECRET")
 CLOUDINARY_CONFIGURED = bool(CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET)
+
+if not CLOUDINARY_CONFIGURED:
+    if IS_PRODUCTION:
+        # Fail loudly rather than silently running a production deployment
+        # that would otherwise fall back to doing image compression on
+        # this server's own CPU/RAM — the whole point of requiring
+        # Cloudinary is to guarantee that never happens.
+        raise RuntimeError(
+            "CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET "
+            "environment variables are all required when FLASK_ENV=production."
+        )
+    logger.warning(
+        "Cloudinary not configured — uploaded images will be stored and "
+        "served locally, uncompressed, and won't survive a redeploy on an "
+        "ephemeral filesystem. Fine for local development; set "
+        "CLOUDINARY_CLOUD_NAME/CLOUDINARY_API_KEY/CLOUDINARY_API_SECRET "
+        "before deploying."
+    )
+
 
 # -------------------------------------------------------------------
 # App Configuration
@@ -270,6 +304,20 @@ app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["SESSION_COOKIE_SECURE"] = IS_PRODUCTION  # requires HTTPS in prod (Render provides this)
 app.config["REMEMBER_COOKIE_HTTPONLY"] = True
 app.config["REMEMBER_COOKIE_SECURE"] = IS_PRODUCTION
+
+# gzip/br-compress HTTP responses (JSON API payloads, HTML pages, the JS/CSS
+# in static/). Images are excluded — they're already compressed formats, so
+# re-running deflate over them just burns CPU for ~0 size reduction. This
+# doesn't touch Socket.IO traffic (that's a separate transport), but every
+# plain HTTP response — which is most of this app's chat/feed/notification
+# polling and page loads — benefits.
+app.config["COMPRESS_MIMETYPES"] = [
+    "text/html", "text/css", "text/xml", "text/plain",
+    "application/json", "application/javascript", "application/xml",
+]
+app.config["COMPRESS_LEVEL"] = 6
+app.config["COMPRESS_MIN_SIZE"] = 500
+Compress(app)
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(CHAT_PHOTOS_FOLDER, exist_ok=True)
@@ -374,10 +422,17 @@ class User(db.Model, UserMixin):
     )
 
     def set_password(self, raw_password):
-        self.password_hash = generate_password_hash(raw_password)
+        # scrypt (Werkzeug's default hash) is deliberately CPU-expensive —
+        # that's what makes it resistant to offline cracking — but on a
+        # single-worker eventlet deployment that also means every
+        # register/login call would otherwise pin the one worker thread
+        # for ~100-300ms and stall every other request and open
+        # Socket.IO connection for that window. tpool.execute runs it on
+        # a real OS thread instead, without weakening the hash at all.
+        self.password_hash = eventlet.tpool.execute(generate_password_hash, raw_password)
 
     def check_password(self, raw_password):
-        return check_password_hash(self.password_hash, raw_password)
+        return eventlet.tpool.execute(check_password_hash, self.password_hash, raw_password)
 
     def to_dict(self, include_email=False, include_presence=False):
         data = {
@@ -1406,10 +1461,23 @@ def generate_unique_username(email, full_name):
     return candidate
 
 
-def verify_is_real_image(filepath):
-    """Confirms the uploaded file is actually a valid image (not just a
-    file with a spoofed .png/.jpg extension), and that it isn't an
-    absurdly large image designed to exhaust memory on decode."""
+def _validate_uploaded_image_blocking(filepath):
+    """Confirms the saved file is a genuine image (not something with a
+    spoofed .png/.jpg extension) and isn't an absurdly large image
+    designed to exhaust memory on decode. This is the only image
+    processing this server ever does — no resize, no recompress. That
+    work is Cloudinary's job now (see cloudinary_delivery_url()), by
+    design: Cloudinary is a required dependency specifically so this
+    server never has to pay CPU/RAM for it.
+
+    Still pure C-level Pillow work, so it must run through eventlet's
+    thread pool (see validate_uploaded_image below) rather than being
+    called directly from a request handler — Image.open()/.verify() does
+    not cooperate with eventlet's green threads the way monkey-patched
+    socket/file I/O does.
+
+    Returns True if the file should be kept; False if it should be rejected.
+    """
     try:
         with Image.open(filepath) as img:
             img.verify()
@@ -1421,6 +1489,16 @@ def verify_is_real_image(filepath):
         return True
     except (UnidentifiedImageError, OSError, ValueError):
         return False
+
+
+def validate_uploaded_image(filepath):
+    """Confirms filepath is a genuine, storable image. Offloaded to
+    eventlet's thread pool so this CPU-bound Pillow check can't stall
+    the single-worker event loop for other users. Compression/resizing
+    is intentionally not done here — that's Cloudinary's responsibility
+    (see cloudinary_delivery_url()).
+    """
+    return eventlet.tpool.execute(_validate_uploaded_image_blocking, filepath)
 
 
 def _cloudinary_signature(params):
@@ -1447,6 +1525,40 @@ def cloudinary_public_id_for(relative_path):
     """
     root, _ext = os.path.splitext(relative_path)
     return f"zoble/{root}"
+
+
+def cloudinary_max_dimension_for(relative_path):
+    """Content photos (chat/story/post) get a larger cap than avatars
+    (profile pictures, group photos), mirroring the same split used for
+    local optimization — see IMAGE_MAX_DIMENSION_AVATAR/_CONTENT."""
+    content_prefixes = ("chat_photos/", "story_photos/", "post_photos/")
+    if relative_path.startswith(content_prefixes):
+        return IMAGE_MAX_DIMENSION_CONTENT
+    return IMAGE_MAX_DIMENSION_AVATAR
+
+
+def cloudinary_delivery_url(relative_path):
+    """Builds a Cloudinary delivery URL that does the resizing +
+    recompression on Cloudinary's side via URL-based transformations,
+    rather than locally with Pillow:
+
+      f_auto  — serves WebP/AVIF to browsers that support it, JPEG/PNG
+                 otherwise, whichever is smallest for that viewer
+      q_auto  — Cloudinary's perceptual quality analyzer picks the lowest
+                 quality that doesn't look worse, instead of a fixed 82
+      w_<n>,c_limit — downscale to at most <n>px on the long edge,
+                 never upscale (c_limit only shrinks)
+
+    The transformed derivative is generated once on first request and
+    cached at Cloudinary's CDN edge after that — later requests for the
+    same public_id + transformation are served straight from cache, no
+    fresh compute or origin round-trip.
+    """
+    public_id = cloudinary_public_id_for(relative_path)
+    ext = (os.path.splitext(relative_path)[1].lstrip(".") or "jpg").lower()
+    max_dim = cloudinary_max_dimension_for(relative_path)
+    transform = f"f_auto,q_auto,w_{max_dim},c_limit"
+    return f"https://res.cloudinary.com/{CLOUDINARY_CLOUD_NAME}/image/upload/{transform}/{public_id}.{ext}"
 
 
 def cloudinary_mirror_upload(local_filepath, relative_path):
@@ -1646,29 +1758,30 @@ def db_status():
 
 @app.route("/static/uploads/<path:filename>")
 def uploaded_file(filename):
-    """Serves an uploaded file from local disk, falling back to its
-    Cloudinary mirror when the local copy is missing.
+    """Serves an uploaded image.
 
-    Render's free-tier filesystem is wiped on every redeploy/restart, so a
-    file uploaded before the most recent deploy can vanish from disk even
-    though the database row referencing it (User.profile_pic,
-    Message/Story/Post/GroupMessage.image_path, Group.photo) survives in
-    Turso. Rather than 404ing in that case, redirect to the copy
-    cloudinary_mirror_upload() saved at upload time. This intentionally
-    shares its URL prefix with, and takes priority over, Flask's default
-    static file route (see uploaded_file's more specific rule vs. the
-    built-in '/static/<path:filename>') — every existing template and
-    client-side script that builds an image URL as '/static/uploads/...'
-    keeps working unchanged either way.
+    Cloudinary — not this server — owns compression: cloudinary_delivery_url()
+    redirects to a transformation URL (f_auto/q_auto/w_<cap>,c_limit) that
+    Cloudinary resizes, re-encodes, and CDN-caches on its own infrastructure.
+    That's a redirect response only (a few hundred bytes) — the actual
+    image bytes never pass through this process, so it costs this server
+    neither the CPU to transcode nor the bandwidth to serve the file.
+    validate_uploaded_image() never resizes/recompresses locally, by
+    design, so this is the only place compression happens at all in
+    production (Cloudinary is required there — see the startup check
+    near CLOUDINARY_CONFIGURED above).
+
+    Local disk still holds the origin copy that Cloudinary mirrors from.
+    The plain local-file fallback below only fires when Cloudinary isn't
+    configured — which, outside of local development (allowed with a
+    warning; see above), shouldn't happen in practice.
     """
+    if CLOUDINARY_CONFIGURED:
+        return redirect(cloudinary_delivery_url(filename))
+
     local_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
     if os.path.isfile(local_path):
         return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
-
-    if CLOUDINARY_CONFIGURED:
-        public_id = cloudinary_public_id_for(filename)
-        ext = (os.path.splitext(filename)[1].lstrip(".") or "jpg").lower()
-        return redirect(f"https://res.cloudinary.com/{CLOUDINARY_CLOUD_NAME}/image/upload/{public_id}.{ext}")
 
     abort(404)
 
@@ -2186,7 +2299,7 @@ def register_start():
             db.session.add(pending)
 
         pending.full_name = full_name
-        pending.password_hash = generate_password_hash(password)
+        pending.password_hash = eventlet.tpool.execute(generate_password_hash, password)
         pending.otp_code = code
         pending.otp_expires_at = now + timedelta(minutes=OTP_EXPIRY_MINUTES)
         pending.attempts = 0
@@ -2819,7 +2932,7 @@ def update_profile_picture():
 
     # Verify the saved file is genuinely an image before trusting it — a
     # extension check alone can be spoofed (e.g. a script renamed to .png).
-    if not verify_is_real_image(filepath):
+    if not validate_uploaded_image(filepath):
         try:
             os.remove(filepath)
         except OSError:
@@ -2908,7 +3021,7 @@ def send_photo_message(recipient_id):
 
     # Same real-image + decompression-bomb guard used for profile pictures —
     # an extension check alone can be spoofed.
-    if not verify_is_real_image(filepath):
+    if not validate_uploaded_image(filepath):
         try:
             os.remove(filepath)
         except OSError:
@@ -3249,7 +3362,7 @@ def send_group_photo_message(group_id):
         logger.exception("Failed to save uploaded group chat photo")
         return jsonify({"error": "Could not save the uploaded file."}), 500
 
-    if not verify_is_real_image(filepath):
+    if not validate_uploaded_image(filepath):
         try:
             os.remove(filepath)
         except OSError:
@@ -3363,7 +3476,7 @@ def update_group_photo(group_id):
         logger.exception("Failed to save uploaded group photo")
         return jsonify({"error": "Could not save the uploaded file."}), 500
 
-    if not verify_is_real_image(filepath):
+    if not validate_uploaded_image(filepath):
         try:
             os.remove(filepath)
         except OSError:
@@ -3781,7 +3894,7 @@ def post_story():
 
     # Same real-image + decompression-bomb guard used elsewhere — an
     # extension check alone can be spoofed.
-    if not verify_is_real_image(filepath):
+    if not validate_uploaded_image(filepath):
         try:
             os.remove(filepath)
         except OSError:
@@ -4090,7 +4203,7 @@ def create_post():
             logger.exception("Failed to save uploaded post photo")
             return jsonify({"error": "Could not save the uploaded file."}), 500
 
-        if not verify_is_real_image(filepath):
+        if not validate_uploaded_image(filepath):
             try:
                 os.remove(filepath)
             except OSError:
