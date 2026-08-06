@@ -360,7 +360,33 @@ db = SQLAlchemy(app)
 # this file. Returning a value from do_execute*/do_connect tells
 # SQLAlchemy "this event already did the work," which skips its own
 # (blocking) call to the same function.
-from concurrent.futures import ThreadPoolExecutor
+import eventlet.patcher
+# NOTE: this must be the *unpatched* ThreadPoolExecutor. `concurrent.futures`
+# is imported here after eventlet.monkey_patch() ran at the top of this
+# file, so a plain `from concurrent.futures import ThreadPoolExecutor`
+# silently gets an executor whose worker "threads" are actually eventlet
+# greenthreads (concurrent.futures.thread builds its workers on top of the
+# stdlib `threading` module, which monkey_patch() rewired in place).
+#
+# That's fatal for the dedicated-connection-thread scheme below: each
+# do_connect() call spawns one of these workers and then does
+# `eventlet.tpool.execute(future.result)` to wait on it from a *real* OS
+# thread (tpool always uses genuine threads, patched or not). A real OS
+# thread blocking on a greenlet-backed Future's condition variable needs to
+# hand control back to a waiter greenlet that was created on that same
+# real thread — but when the future resolves, the notify happens on the
+# main hub greenlet instead, and eventlet's hub raises exactly this:
+# `greenlet.error: Cannot switch to a different thread`, surfaced from
+# hub.py's fire_timers -> semaphore._do_acquire -> waiter.switch(). That
+# crash was what was killing every DB connection attempt in production
+# (registration/login "hang or reset").
+#
+# eventlet.patcher.original() briefly restores the pre-monkey-patch
+# versions of stdlib modules and imports a fresh copy of the target under
+# that restored state, so the ThreadPoolExecutor we get back here spawns
+# genuine OS threads whose synchronization primitives work correctly no
+# matter which OS thread (main hub or a tpool worker) touches them.
+ThreadPoolExecutor = eventlet.patcher.original('concurrent.futures').ThreadPoolExecutor
 from sqlalchemy.engine import Engine as _SAEngine
 from sqlalchemy import event as _sa_event
 
