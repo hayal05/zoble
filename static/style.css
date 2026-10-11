@@ -61,7 +61,7 @@ html, body {
        this stops it from reaching the document itself and triggering a
        native pull-to-refresh, which would silently reload the whole page
        and exit whatever overlay was open. */
-    overscroll-behavior-y: contain;
+    overscroll-behavior-y: none;
 }
 
 body {
